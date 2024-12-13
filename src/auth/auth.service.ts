@@ -20,18 +20,21 @@ export class AuthService {
     private jwtService: JwtService,
   ) {}
 
-  private async uploadLicenseFile(
-    file: Express.Multer.File,
-    userId: string,
-  ): Promise<string> {
-    const fileExt = file.originalname.split('.').pop();
-    const fileName = `${userId}-${Date.now()}.${fileExt}`;
-    const filePath = `licenses/${fileName}`;
+  async signUp(signUpDto: SignUpDto, licenseFile: Express.Multer.File) {
+    // 파일 유효성 검사
+    validateFile(licenseFile);
 
-    const { error: uploadError, data } = await this.supabase.storage
+    const hashedPassword = await bcrypt.hash(signUpDto.password, 10);
+
+    // 먼저 파일을 업로드
+    const fileExt = licenseFile.originalname.split('.').pop();
+    const tempFileName = `temp-${Date.now()}.${fileExt}`;
+    const tempFilePath = `temp/${tempFileName}`;
+
+    const { error: uploadError } = await this.supabase.storage
       .from('lawyer-licenses')
-      .upload(filePath, file.buffer, {
-        contentType: file.mimetype,
+      .upload(tempFilePath, licenseFile.buffer, {
+        contentType: licenseFile.mimetype,
         upsert: false,
       });
 
@@ -39,59 +42,35 @@ export class AuthService {
       throw new BadRequestException('파일 업로드에 실패했습니다.');
     }
 
-    return filePath;
-  }
+    try {
+      // 데이터베이스 작업을 트랜잭션으로 처리
+      const { error } = await this.supabase.rpc('create_lawyer_account', {
+        p_email: signUpDto.email,
+        p_password: hashedPassword,
+        p_name: signUpDto.name,
+        p_nickname: signUpDto.nickname,
+        p_phone: signUpDto.phone,
+        p_file_path: tempFilePath,
+      });
 
-  async signUp(signUpDto: SignUpDto, licenseFile: Express.Multer.File) {
-    // 파일 유효성 검사
-    validateFile(licenseFile);
+      if (error) {
+        // 트랜잭션 실패 시 업로드된 파일 삭제
+        await this.supabase.storage
+          .from('lawyer-licenses')
+          .remove([tempFilePath]);
+        throw error;
+      }
 
-    const hashedPassword = await bcrypt.hash(signUpDto.password, 10);
-
-    // 트랜잭션 시작
-    const { data: user, error: userError } = await this.supabase
-      .from('users')
-      .insert([
-        {
-          email: signUpDto.email,
-          password: hashedPassword,
-          name: signUpDto.name,
-          nickname: signUpDto.nickname,
-          phone: signUpDto.phone,
-          status: 'PENDING', // 관리자 승인 대기 상태
-        },
-      ])
-      .select()
-      .single();
-
-    if (userError) {
+      return {
+        message: '회원가입이 완료되었습니다. 관리자 승인을 기다려주세요.',
+      };
+    } catch (error) {
+      // 에러 발생 시 업로드된 파일 삭제
+      await this.supabase.storage
+        .from('lawyer-licenses')
+        .remove([tempFilePath]);
       throw new BadRequestException('회원가입에 실패했습니다.');
     }
-
-    // 파일 업로드
-    const filePath = await this.uploadLicenseFile(licenseFile, user.id);
-
-    // 라이센스 정보 저장
-    const { error: licenseError } = await this.supabase
-      .from('lawyer_licenses')
-      .insert([
-        {
-          user_id: user.id,
-          file_path: filePath,
-          status: 'PENDING',
-        },
-      ]);
-
-    if (licenseError) {
-      // 롤백: 업로드된 파일과 사용자 정보 삭제
-      await this.supabase.storage.from('lawyer-licenses').remove([filePath]);
-      await this.supabase.from('users').delete().eq('id', user.id);
-      throw new BadRequestException('자격증 정보 저장에 실패했습니다.');
-    }
-
-    return {
-      message: '회원가입이 완료되었습니다. 관리자 승인을 기다려주세요.',
-    };
   }
 
   async signIn(signInDto: SignInDto) {
